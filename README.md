@@ -38,12 +38,12 @@ npm run db:migrate
 
 ```powershell
 cd D:\workspace\front\ielts_accent_coach
-adb reverse tcp:8787 tcp:8787
+adb reverse tcp:8041 tcp:8041
 $env:FLUTTER_SKIP_UPDATE_CHECK='true'
 flutter --no-version-check run
 ```
 
-APP 默认请求 `http://127.0.0.1:8787`。真机通过 `adb reverse` 访问电脑上的代理，不需要在同一 Wi-Fi 下暴露服务端口。
+APP 默认请求 `http://127.0.0.1:8041`。真机通过 `adb reverse` 访问电脑上的代理，不需要在同一 Wi-Fi 下暴露服务端口。
 
 ## 构建 APK
 
@@ -63,7 +63,7 @@ flutter --no-version-check build apk --debug
 - `DASHSCOPE_API_URL`：OpenAI 兼容 Chat Completions 地址
 - `DASHSCOPE_MODEL`：默认 `qwen-plus`
 - `DASHSCOPE_ASR_MODEL`：语音识别模型，默认 `qwen3-asr-flash`
-- `PORT`：本机代理端口，默认 `8787`
+- `PORT`：本机代理端口，默认 `8041`
 - `DB_HOST` / `DB_PORT`：PostgreSQL 地址和端口
 - `DB_USER` / `DB_PASSWORD`：PostgreSQL 登录信息
 - `DB_NAME`：独立业务数据库，默认 `ielts_accent_lab`
@@ -72,3 +72,7 @@ flutter --no-version-check build apk --debug
 数据库只保存用户身份、会话、参考文本、语音转写文本、评分、训练要求和 AI 对话。WAV 文件保存在 Android 应用缓存目录 `practice_recordings`，转写请求完成后不会写入 PostgreSQL；清理 APP 缓存或卸载 APP 会删除这些本地录音。
 
 Android 朗读与识别使用手机当前安装的系统语音服务。若手机缺少某个英语语音包，可在系统的“文字转语音”设置中安装；后续接入 Azure Speech 时，应继续由本机/云端后端持有 Azure Key，不能放入 Flutter 客户端。
+
+## 启动端口
+
+网页入口：原生移动应用，不监听 HTTP 端口；后台服务：8041。完整启动约定见 [PORTS.md](./PORTS.md)。

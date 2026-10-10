@@ -8,7 +8,7 @@ import {
   saveConversationExchange,
 } from './database.js';
 
-const port = Number.parseInt(process.env.PORT ?? '8787', 10);
+const port = Number.parseInt(process.env.PORT ?? '8041', 10);
 const apiKey = process.env.DASHSCOPE_API_KEY?.trim();
 const apiUrl = process.env.DASHSCOPE_API_URL?.trim()
   ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';

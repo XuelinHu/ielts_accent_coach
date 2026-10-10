@@ -127,7 +127,7 @@ class _AppShellState extends State<AppShell> {
   int _tabIndex = 0;
   int _lineIndex = 0;
   AccentProfile _accent = AccentProfile.british;
-  String _apiBaseUrl = 'http://127.0.0.1:8787';
+  String _apiBaseUrl = 'http://127.0.0.1:8041';
   final List<AttemptRecord> _attempts = [];
   late final Future<void> _backendReady;
   String? _userId;
@@ -1078,7 +1078,7 @@ class _CoachPageState extends State<CoachPage> {
         content: TextField(
           controller: controller,
           keyboardType: TextInputType.url,
-          decoration: const InputDecoration(hintText: 'http://127.0.0.1:8787'),
+          decoration: const InputDecoration(hintText: 'http://127.0.0.1:8041'),
         ),
         actions: [
           TextButton(
