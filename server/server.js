@@ -7,12 +7,16 @@ import {
   listPracticeAttempts,
   saveConversationExchange,
 } from './database.js';
+import { pageMetadata, parsePageParams } from './pagination.js';
 
 const port = Number.parseInt(process.env.PORT ?? '8041', 10);
-const apiKey = process.env.DASHSCOPE_API_KEY?.trim();
-const apiUrl = process.env.DASHSCOPE_API_URL?.trim()
+const aiApiKey = (process.env.AI_API_KEY || process.env.DASHSCOPE_API_KEY)?.trim();
+const apiUrl = (process.env.AI_BASE_URL || process.env.DASHSCOPE_API_URL)?.trim()
   ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
-const model = process.env.DASHSCOPE_MODEL?.trim() ?? 'qwen-plus';
+const asrApiUrl = process.env.DASHSCOPE_API_URL?.trim()
+  ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
+const model = (process.env.AI_MODEL || process.env.DASHSCOPE_MODEL)?.trim() ?? 'qwen-plus';
+const asrApiKey = process.env.DASHSCOPE_API_KEY?.trim();
 const asrModel = process.env.DASHSCOPE_ASR_MODEL?.trim() ?? 'qwen3-asr-flash';
 
 const systemPrompt = `你是一名严谨、友好的 IELTS Speaking 口语教练。你会收到用户问题和可选的跟读上下文。
@@ -38,10 +42,10 @@ const server = http.createServer(async (request, response) => {
     const database = await databaseHealth();
     sendJson(response, 200, {
       ok: true,
-      provider: 'Alibaba Cloud Model Studio',
+      provider: process.env.AI_BASE_URL ? 'LAN OpenAI-compatible API' : 'Alibaba Cloud Model Studio',
       model,
       asrModel,
-      configured: Boolean(apiKey),
+      configured: Boolean(aiApiKey),
       database,
     });
     return;
@@ -80,10 +84,13 @@ const server = http.createServer(async (request, response) => {
     }
     try {
       const userId = requireUuid(requestUrl.searchParams.get('userId'), 'userId');
-      const requestedLimit = Number.parseInt(requestUrl.searchParams.get('limit') ?? '50', 10);
-      const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 50;
-      const records = await listPracticeAttempts(userId, limit);
+      const paging = parsePageParams({
+        page: requestUrl.searchParams.get('page'),
+        pageSize: requestUrl.searchParams.get('pageSize'),
+      });
+      const { rows: records, total } = await listPracticeAttempts(userId, paging);
       sendJson(response, 200, {
+        ...pageMetadata(total, paging),
         attempts: records.map((record) => ({
           id: record.id,
           accent: record.accent,
@@ -145,7 +152,7 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.method === 'POST' && requestUrl.pathname === '/api/transcribe') {
-    if (!apiKey) {
+    if (!asrApiKey) {
       sendJson(response, 503, { error: '本机服务尚未配置 DASHSCOPE_API_KEY。' });
       return;
     }
@@ -157,10 +164,10 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      const upstream = await fetch(apiUrl, {
+      const upstream = await fetch(asrApiUrl, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${apiKey}`,
+          Authorization: `Bearer ${asrApiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
@@ -209,8 +216,8 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.method === 'POST' && requestUrl.pathname === '/api/coach') {
-    if (!apiKey) {
-      sendJson(response, 503, { error: '本机服务尚未配置 DASHSCOPE_API_KEY。' });
+    if (!aiApiKey) {
+      sendJson(response, 503, { error: '本机服务尚未配置 AI_API_KEY 或 DASHSCOPE_API_KEY。' });
       return;
     }
 
@@ -238,7 +245,7 @@ const server = http.createServer(async (request, response) => {
       const upstream = await fetch(apiUrl, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${apiKey}`,
+          Authorization: `Bearer ${aiApiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ model, messages, temperature: 0.45 }),
@@ -299,7 +306,7 @@ const server = http.createServer(async (request, response) => {
 
 server.listen(port, '127.0.0.1', () => {
   console.log(`IELTS Accent Lab server listening on http://127.0.0.1:${port}`);
-  console.log(`Model Studio: ${apiKey ? `configured (${model})` : 'not configured'}`);
+  console.log(`AI provider: ${aiApiKey ? `configured (${model})` : 'not configured'}`);
 });
 
 function setCorsHeaders(response) {

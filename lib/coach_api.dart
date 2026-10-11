@@ -26,6 +26,22 @@ class SavedAttempt {
   final DateTime createdAt;
 }
 
+class StoredAttemptPage {
+  const StoredAttemptPage({
+    required this.attempts,
+    required this.total,
+    required this.page,
+    required this.pageSize,
+    required this.totalPages,
+  });
+
+  final List<StoredAttempt> attempts;
+  final int total;
+  final int page;
+  final int pageSize;
+  final int totalPages;
+}
+
 class StoredAttempt {
   const StoredAttempt({
     required this.id,
@@ -113,12 +129,20 @@ class CoachApi {
     );
   }
 
-  Future<List<StoredAttempt>> loadAttempts(String userId) async {
+  Future<StoredAttemptPage> loadAttempts(
+    String userId, {
+    int page = 1,
+    int pageSize = 20,
+  }) async {
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
     try {
       final uri = Uri.parse(
         '$_normalizedBase/api/practice-attempts',
-      ).replace(queryParameters: {'userId': userId, 'limit': '50'});
+      ).replace(queryParameters: {
+        'userId': userId,
+        'page': '$page',
+        'pageSize': '$pageSize',
+      });
       final request = await client.getUrl(uri);
       final response = await request.close().timeout(
         const Duration(seconds: 15),
@@ -128,10 +152,17 @@ class CoachApi {
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw CoachApiException(payload['error'] as String? ?? '读取练习历史失败。');
       }
-      return (payload['attempts'] as List<dynamic>? ?? const [])
+      final attempts = (payload['attempts'] as List<dynamic>? ?? const [])
           .whereType<Map<String, dynamic>>()
           .map(StoredAttempt.fromJson)
           .toList();
+      return StoredAttemptPage(
+        attempts: attempts,
+        total: (payload['total'] as num?)?.toInt() ?? attempts.length,
+        page: (payload['page'] as num?)?.toInt() ?? page,
+        pageSize: (payload['pageSize'] as num?)?.toInt() ?? pageSize,
+        totalPages: (payload['totalPages'] as num?)?.toInt() ?? 1,
+      );
     } on SocketException {
       throw const CoachApiException('无法连接本机服务，请确认 Node 服务已启动并执行了 adb reverse。');
     } on TimeoutException {

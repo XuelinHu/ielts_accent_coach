@@ -129,6 +129,13 @@ class _AppShellState extends State<AppShell> {
   AccentProfile _accent = AccentProfile.british;
   String _apiBaseUrl = 'http://127.0.0.1:8041';
   final List<AttemptRecord> _attempts = [];
+  final List<AttemptRecord> _historyAttempts = [];
+  AttemptRecord? _latestAttempt;
+  int _historyPage = 1;
+  int _historyPageSize = 20;
+  int _historyTotal = 0;
+  int _historyTotalPages = 1;
+  bool _historyLoading = false;
   late final Future<void> _backendReady;
   String? _userId;
   String? _sessionId;
@@ -163,7 +170,7 @@ class _AppShellState extends State<AppShell> {
         deviceModel: identity.deviceModel,
         appVersion: identity.appVersion,
       );
-      final storedAttempts = await api.loadAttempts(registration.userId);
+      final storedPage = await api.loadAttempts(registration.userId);
       final recordingReferences = await NativeSpeechService()
           .getRecordingReferences();
       if (!mounted) return;
@@ -171,16 +178,25 @@ class _AppShellState extends State<AppShell> {
         _userId = registration.userId;
         _sessionId = registration.sessionId;
         _databaseOnline = true;
-        _attempts
-          ..clear()
-          ..addAll(
-            storedAttempts.map(
+        final attempts = storedPage.attempts
+            .map(
               (attempt) => _attemptFromStorage(
                 attempt,
                 recordingPath: recordingReferences[attempt.id],
               ),
-            ),
-          );
+            )
+            .toList();
+        _attempts
+          ..clear()
+          ..addAll(attempts);
+        _historyAttempts
+          ..clear()
+          ..addAll(attempts);
+        _latestAttempt = attempts.firstOrNull;
+        _historyPage = storedPage.page;
+        _historyPageSize = storedPage.pageSize;
+        _historyTotal = storedPage.total;
+        _historyTotalPages = storedPage.totalPages;
       });
     } catch (_) {
       if (mounted) setState(() => _databaseOnline = false);
@@ -232,8 +248,59 @@ class _AppShellState extends State<AppShell> {
   }
 
   void _addAttempt(AttemptRecord attempt) {
-    setState(() => _attempts.insert(0, attempt));
+    setState(() {
+      _attempts.insert(0, attempt);
+      _latestAttempt = attempt;
+      _historyTotal++;
+      if (_historyPage == 1) {
+        _historyAttempts.insert(0, attempt);
+        if (_historyAttempts.length > _historyPageSize) {
+          _historyAttempts.removeLast();
+        }
+      }
+      _historyTotalPages =
+          (_historyTotal / _historyPageSize).ceil().clamp(1, 1 << 30).toInt();
+    });
     unawaited(_persistAttempt(attempt));
+  }
+
+  Future<void> _loadHistoryPage(int page) async {
+    final userId = _userId;
+    if (userId == null || !_databaseOnline || _historyLoading) return;
+    setState(() => _historyLoading = true);
+    try {
+      final result = await CoachApi(baseUrl: _apiBaseUrl).loadAttempts(
+        userId,
+        page: page,
+        pageSize: _historyPageSize,
+      );
+      final recordingReferences = await NativeSpeechService()
+          .getRecordingReferences();
+      if (!mounted) return;
+      setState(() {
+        _historyAttempts
+          ..clear()
+          ..addAll(
+            result.attempts.map(
+              (attempt) => _attemptFromStorage(
+                attempt,
+                recordingPath: recordingReferences[attempt.id],
+              ),
+            ),
+          );
+        _historyPage = result.page;
+        _historyTotal = result.total;
+        _historyTotalPages = result.totalPages;
+      });
+    } on CoachApiException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('读取练习历史失败：${error.message}')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _historyLoading = false);
+    }
   }
 
   Future<void> _persistAttempt(AttemptRecord attempt) async {
@@ -297,7 +364,7 @@ class _AppShellState extends State<AppShell> {
       ),
       CoachPage(
         messages: _messages,
-        latestAttempt: _attempts.firstOrNull,
+        latestAttempt: _latestAttempt,
         apiBaseUrl: _apiBaseUrl,
         userId: _userId,
         sessionId: _sessionId,
@@ -308,9 +375,14 @@ class _AppShellState extends State<AppShell> {
         onApiBaseUrlChanged: (value) => setState(() => _apiBaseUrl = value),
       ),
       ProgressPage(
-        attempts: _attempts,
+        attempts: _historyAttempts,
         databaseOnline: _databaseOnline,
         syncing: _pendingSyncs > 0,
+        page: _historyPage,
+        total: _historyTotal,
+        totalPages: _historyTotalPages,
+        loading: _historyLoading,
+        onPageChanged: _loadHistoryPage,
       ),
     ];
 
@@ -1267,11 +1339,21 @@ class ProgressPage extends StatelessWidget {
     required this.attempts,
     required this.databaseOnline,
     required this.syncing,
+    required this.page,
+    required this.total,
+    required this.totalPages,
+    required this.loading,
+    required this.onPageChanged,
   });
 
   final List<AttemptRecord> attempts;
   final bool databaseOnline;
   final bool syncing;
+  final int page;
+  final int total;
+  final int totalPages;
+  final bool loading;
+  final ValueChanged<int> onPageChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -1306,15 +1388,15 @@ class ProgressPage extends StatelessWidget {
               children: [
                 Expanded(
                   child: _SummaryValue(
-                    value: '${attempts.length}',
+                    value: '$total',
                     label: '完成次数',
                   ),
                 ),
                 Expanded(
-                  child: _SummaryValue(value: '$average', label: '平均得分'),
+                  child: _SummaryValue(value: '$average', label: '本页均分'),
                 ),
                 Expanded(
-                  child: _SummaryValue(value: '$best', label: '最佳成绩'),
+                  child: _SummaryValue(value: '$best', label: '本页最佳'),
                 ),
               ],
             ),
@@ -1322,6 +1404,7 @@ class ProgressPage extends StatelessWidget {
           const SizedBox(height: 24),
           Text('最近练习', style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 12),
+          if (loading) const LinearProgressIndicator(),
           if (attempts.isEmpty)
             const _EmptyProgress()
           else
@@ -1362,6 +1445,31 @@ class ProgressPage extends StatelessWidget {
                   ),
                 ),
               ),
+          if (databaseOnline && totalPages > 1)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Row(
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: page > 1 && !loading
+                        ? () => onPageChanged(page - 1)
+                        : null,
+                    icon: const Icon(Icons.chevron_left),
+                    label: const Text('上一页'),
+                  ),
+                  Expanded(
+                    child: Center(child: Text('$page / $totalPages 页')),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: page < totalPages && !loading
+                        ? () => onPageChanged(page + 1)
+                        : null,
+                    icon: const Icon(Icons.chevron_right),
+                    label: const Text('下一页'),
+                  ),
+                ],
+              ),
+            ),
         ],
       ),
     );

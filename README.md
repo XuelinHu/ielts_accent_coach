@@ -71,6 +71,25 @@ flutter --no-version-check build apk --debug
 
 数据库只保存用户身份、会话、参考文本、语音转写文本、评分、训练要求和 AI 对话。WAV 文件保存在 Android 应用缓存目录 `practice_recordings`，转写请求完成后不会写入 PostgreSQL；清理 APP 缓存或卸载 APP 会删除这些本地录音。
 
+## 测试
+
+常规测试：
+
+```powershell
+cd D:\workspace\front\ielts_accent_coach\server
+npm test
+```
+
+PostgreSQL 集成测试会创建/写入数据库并模拟 AI 与 ASR 响应。仅使用以 `_test` 结尾的独立库；测试数据库会保留供检查：
+
+```powershell
+cd D:\workspace\front\ielts_accent_coach\server
+$env:DB_NAME = 'ielts_accent_lab_local_test'
+npm run db:migrate
+$env:RUN_POSTGRES_INTEGRATION = '1'
+npm run test:integration
+```
+
 Android 朗读与识别使用手机当前安装的系统语音服务。若手机缺少某个英语语音包，可在系统的“文字转语音”设置中安装；后续接入 Azure Speech 时，应继续由本机/云端后端持有 Azure Key，不能放入 Flutter 客户端。
 
 ## 启动端口

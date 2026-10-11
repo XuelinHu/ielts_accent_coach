@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node --env-file=.env server.js",
     "dev": "node --watch --env-file=.env server.js",
-    "db:migrate": "node --env-file=.env migrate.js"
+    "db:migrate": "node --env-file=.env migrate.js",
+    "test": "node --test ../test/*.test.js",
+    "test:integration": "node --env-file=.env --test ../test/postgres-api.integration.test.js"
   },
   "engines": {
     "node": ">=20"

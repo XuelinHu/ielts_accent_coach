@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
+import { pageMetadata } from './pagination.js';
 
 const { Pool } = pg;
 
@@ -122,19 +123,24 @@ export async function insertPracticeAttempt(input) {
   return result.rows[0];
 }
 
-export async function listPracticeAttempts(userId, limit = 50) {
-  requireDatabase();
-  const result = await pool.query(
+export async function listPracticeAttempts(userId, { page, pageSize }, executor = pool) {
+  if (!executor) requireDatabase();
+  const countResult = await executor.query(
+    'SELECT COUNT(*)::int AS total FROM practice_attempt WHERE user_id = $1',
+    [userId],
+  );
+  const metadata = pageMetadata(Number(countResult.rows[0]?.total ?? 0), { page, pageSize });
+  const result = await executor.query(
     `SELECT id, accent, topic, level, reference_text, transcript_text,
             focus_text, overall_score, accuracy_score, completeness_score,
             fluency_score, next_requirements, created_at
      FROM practice_attempt
      WHERE user_id = $1
-     ORDER BY created_at DESC
-     LIMIT $2`,
-    [userId, limit],
+     ORDER BY created_at DESC, id DESC
+     LIMIT $2 OFFSET $3`,
+    [userId, pageSize, (metadata.page - 1) * pageSize],
   );
-  return result.rows;
+  return { rows: result.rows, ...metadata };
 }
 
 export async function saveConversationExchange({
