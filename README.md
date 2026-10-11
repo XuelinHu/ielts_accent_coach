@@ -1,5 +1,12 @@
 # IELTS Accent Lab
 
+<p align="center">
+  <img height="20" alt="Flutter" src="https://img.shields.io/badge/flutter-used-02569B" />
+  <img height="20" alt="Dart SDK 3.11.4+" src="https://img.shields.io/badge/dart-3.11.4%2B-0175C2" />
+  <img height="20" alt="Node.js 20+" src="https://img.shields.io/badge/node.js-20%2B-339933" />
+  <img height="20" alt="PostgreSQL configured" src="https://img.shields.io/badge/postgresql-configured-4169E1" />
+</p>
+
 面向 Android 的雅思口语跟读 APP。Flutter 负责界面，Kotlin 调用 Android 系统语音识别与朗读，Node 本地代理调用阿里云百炼。
 
 ## 功能
@@ -58,6 +65,13 @@ flutter --no-version-check build apk --debug
 ## 配置
 
 本机密钥配置位于 `server/.env`，示例见 `server/.env.example`。可调整：
+
+首次部署前，使用 PostgreSQL 管理员运行 `server/postgres/provision-role.psql`，创建 `ielts_accent_lab_app` 专属角色和数据库；把该角色的独立口令写入 `server/.env` 后，再运行 `npm run db:migrate`。迁移命令只连接项目数据库，不会用应用账号连接 `postgres` 或创建数据库。IELTS 数据库与 HSK、其他项目相互独立。Windows 本机 PostgreSQL 18 可用下面命令（管理员角色按实际配置填写，口令由 `psql` 交互读取）：
+
+```powershell
+$pgAdmin = Read-Host 'PostgreSQL 管理员角色'
+& 'C:\Program Files\PostgreSQL\18\bin\psql.exe' -h 127.0.0.1 -p 5432 -U $pgAdmin -d postgres -f server/postgres/provision-role.psql
+```
 
 - `DASHSCOPE_API_KEY`：百炼 API Key
 - `DASHSCOPE_API_URL`：OpenAI 兼容 Chat Completions 地址

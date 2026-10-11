@@ -21,29 +21,6 @@ const baseConfig = {
   connectionTimeoutMillis: 5_000,
 };
 
-const maintenanceClient = new Client({ ...baseConfig, database: 'postgres' });
-await maintenanceClient.connect();
-try {
-  await maintenanceClient.query(
-    "SELECT pg_advisory_lock(hashtext('ielts-accent-coach:database-create'))",
-  );
-  const existing = await maintenanceClient.query(
-    'SELECT 1 FROM pg_database WHERE datname = $1',
-    [databaseName],
-  );
-  if (existing.rowCount === 0) {
-    await maintenanceClient.query(`CREATE DATABASE "${databaseName}"`);
-    console.log(`Created database ${databaseName}.`);
-  } else {
-    console.log(`Database ${databaseName} already exists.`);
-  }
-} finally {
-  await maintenanceClient.query(
-    "SELECT pg_advisory_unlock(hashtext('ielts-accent-coach:database-create'))",
-  ).catch(() => {});
-  await maintenanceClient.end();
-}
-
 const client = new Client({ ...baseConfig, database: databaseName });
 await client.connect();
 try {
