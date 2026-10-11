@@ -69,6 +69,21 @@ flutter --no-version-check build apk --debug
 - `DB_NAME`：独立业务数据库，默认 `ielts_accent_lab`
 - `DB_SSL`：公网数据库要求 TLS 时设为 `true`
 
+数据库快照使用 PostgreSQL `pg_dump` custom 格式并通过 AES-256-GCM 加密。先在 `server/.env` 设置独立随机密钥 `DB_BACKUP_ENCRYPTION_KEY`（64 位十六进制），不要提交密钥。默认备份写入 Git 忽略的 `server/backups/`：
+
+```powershell
+cd D:\workspace\front\ielts_accent_coach\server
+npm run db:backup
+```
+
+恢复前先在 PostgreSQL 创建一个名称以 `_test` 结尾、且不同于备份源库的空数据库；恢复命令要求显式 `--replace`，会替换该目标中的对象，并在连接数据库前先验证快照认证标签：
+
+```powershell
+npm run db:restore -- --source .\backups\ielts-accent_lab.pgbak --database ielts_accent_restore_test --replace
+```
+
+恢复仅允许 `_test` 目标，需 PostgreSQL 18 `pg_restore`。隔离备份恢复演练可运行 `npm run test:backup`；该命令会创建一个唯一 `_test` 数据库并保留供检查。
+
 数据库只保存用户身份、会话、参考文本、语音转写文本、评分、训练要求和 AI 对话。WAV 文件保存在 Android 应用缓存目录 `practice_recordings`，转写请求完成后不会写入 PostgreSQL；清理 APP 缓存或卸载 APP 会删除这些本地录音。
 
 ## 测试

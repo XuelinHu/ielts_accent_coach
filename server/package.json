@@ -8,8 +8,11 @@
     "start": "node --env-file=.env server.js",
     "dev": "node --watch --env-file=.env server.js",
     "db:migrate": "node --env-file=.env migrate.js",
+    "db:backup": "node --env-file=.env pg-backup.mjs backup",
+    "db:restore": "node --env-file=.env pg-backup.mjs restore",
     "test": "node --test ../test/*.test.js",
-    "test:integration": "node --env-file=.env --test ../test/postgres-api.integration.test.js"
+    "test:integration": "node --env-file=.env --test ../test/postgres-api.integration.test.js",
+    "test:backup": "node --env-file=.env pg-backup-smoke.mjs"
   },
   "engines": {
     "node": ">=20"
