@@ -107,9 +107,10 @@ class CoachReply {
 }
 
 class CoachApi {
-  CoachApi({required this.baseUrl});
+  CoachApi({required this.baseUrl, required this.accessToken});
 
   String baseUrl;
+  final String accessToken;
 
   String get _normalizedBase => baseUrl.trim().replaceAll(RegExp(r'/+$'), '');
 
@@ -129,8 +130,7 @@ class CoachApi {
     );
   }
 
-  Future<StoredAttemptPage> loadAttempts(
-    String userId, {
+  Future<StoredAttemptPage> loadAttempts({
     int page = 1,
     int pageSize = 20,
   }) async {
@@ -138,12 +138,9 @@ class CoachApi {
     try {
       final uri = Uri.parse(
         '$_normalizedBase/api/practice-attempts',
-      ).replace(queryParameters: {
-        'userId': userId,
-        'page': '$page',
-        'pageSize': '$pageSize',
-      });
+      ).replace(queryParameters: {'page': '$page', 'pageSize': '$pageSize'});
       final request = await client.getUrl(uri);
+      _setAuthorization(request);
       final response = await request.close().timeout(
         const Duration(seconds: 15),
       );
@@ -175,7 +172,6 @@ class CoachApi {
   }
 
   Future<SavedAttempt> saveAttempt({
-    required String userId,
     required String sessionId,
     required String accent,
     required String topic,
@@ -191,7 +187,6 @@ class CoachApi {
     required DateTime createdAt,
   }) async {
     final payload = await _postJson('/api/practice-attempts', {
-      'userId': userId,
       'sessionId': sessionId,
       'accent': accent,
       'topic': topic,
@@ -221,6 +216,7 @@ class CoachApi {
       final request = await client.postUrl(
         Uri.parse('$_normalizedBase/api/transcribe'),
       );
+      _setAuthorization(request);
       request.headers.contentType = ContentType.json;
       request.write(
         jsonEncode({
@@ -256,7 +252,6 @@ class CoachApi {
     required String message,
     required List<CoachMessage> history,
     Map<String, Object?>? practiceContext,
-    String? userId,
     String? sessionId,
     String? conversationId,
     String? practiceAttemptId,
@@ -266,13 +261,13 @@ class CoachApi {
       final request = await client.postUrl(
         Uri.parse('$_normalizedBase/api/coach'),
       );
+      _setAuthorization(request);
       request.headers.contentType = ContentType.json;
       request.write(
         jsonEncode({
           'message': message,
           'history': history.takeLast(8).map((item) => item.toJson()).toList(),
           'practiceContext': ?practiceContext,
-          'userId': ?userId,
           'sessionId': ?sessionId,
           'conversationId': ?conversationId,
           'practiceAttemptId': ?practiceAttemptId,
@@ -313,6 +308,7 @@ class CoachApi {
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
     try {
       final request = await client.postUrl(Uri.parse('$_normalizedBase$path'));
+      _setAuthorization(request);
       request.headers.contentType = ContentType.json;
       request.write(jsonEncode(body));
       final response = await request.close().timeout(
@@ -333,6 +329,10 @@ class CoachApi {
     } finally {
       client.close(force: true);
     }
+  }
+
+  void _setAuthorization(HttpClientRequest request) {
+    request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $accessToken');
   }
 }
 

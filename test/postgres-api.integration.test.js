@@ -1,19 +1,26 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import { createRequire } from 'node:module';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test, { after } from 'node:test';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const requireServerDependency = createRequire(path.join(projectRoot, 'server', 'package.json'));
 const pg = requireServerDependency('pg');
+const { exportJWK, generateKeyPair, SignJWT } = await import(
+  pathToFileURL(requireServerDependency.resolve('jose')).href
+);
 const integrationEnabled = process.env.RUN_POSTGRES_INTEGRATION === '1';
 let apiProcess;
 let mockProvider;
+let mockIssuer;
+let oidcPrivateKey;
+const temporaryUserIds = [];
 
 after(async () => {
   if (apiProcess && apiProcess.exitCode === null) {
@@ -23,6 +30,19 @@ after(async () => {
   if (mockProvider?.listening) {
     mockProvider.close();
     await once(mockProvider, 'close');
+  }
+  if (mockIssuer?.listening) {
+    mockIssuer.close();
+    await once(mockIssuer, 'close');
+  }
+  if (integrationEnabled && temporaryUserIds.length && /_test$/.test(process.env.DB_NAME || '')) {
+    const client = createPgClient();
+    await client.connect();
+    try {
+      await client.query('DELETE FROM app_user WHERE id = ANY($1::uuid[])', [temporaryUserIds]);
+    } finally {
+      await client.end();
+    }
   }
 });
 
@@ -54,9 +74,27 @@ test('PostgreSQL API isolates users, pages attempts, and persists AI exchanges',
   mockProvider.listen(0, '127.0.0.1');
   await once(mockProvider, 'listening');
 
+  const { privateKey, publicKey } = await generateKeyPair('RS256');
+  oidcPrivateKey = privateKey;
+  const publicJwk = await exportJWK(publicKey);
+  publicJwk.kid = 'ielts-integration-key';
+  publicJwk.alg = 'RS256';
+  publicJwk.use = 'sig';
+  mockIssuer = createServer((request, response) => {
+    if (request.url !== '/realms/front/protocol/openid-connect/certs') {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ keys: [publicJwk] }));
+  });
+  mockIssuer.listen(0, '127.0.0.1');
+  await once(mockIssuer, 'listening');
+
   const port = await freePort();
   const baseUrl = `http://127.0.0.1:${port}`;
   const providerUrl = `http://127.0.0.1:${mockProvider.address().port}/v1/chat/completions`;
+  const issuer = `http://127.0.0.1:${mockIssuer.address().port}/realms/front`;
   apiProcess = spawn(process.execPath, ['server.js'], {
     cwd: path.join(projectRoot, 'server'),
     env: {
@@ -68,6 +106,8 @@ test('PostgreSQL API isolates users, pages attempts, and persists AI exchanges',
       DASHSCOPE_API_URL: providerUrl,
       DASHSCOPE_API_KEY: 'integration-only-key',
       DASHSCOPE_ASR_MODEL: 'integration-asr',
+      OIDC_ISSUER: issuer,
+      OIDC_CLIENT_IDS: 'ielts-accent-android',
     },
     stdio: 'ignore',
   });
@@ -78,27 +118,59 @@ test('PostgreSQL API isolates users, pages attempts, and persists AI exchanges',
   assert.equal(health.provider, 'LAN OpenAI-compatible API');
   assert.equal(JSON.stringify(health).includes('integration-only-key'), false);
 
+  const unauthorized = await fetch(`${baseUrl}/api/practice-attempts`);
+  assert.equal(unauthorized.status, 401);
+  const invalidToken = await getToken('invalid-user', 'not-allowed-client');
+  assert.equal((await getJson(`${baseUrl}/api/health`)).ok, true);
+  const denied = await fetch(`${baseUrl}/api/users/ensure`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${invalidToken}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ installationId: 'must-not-register' }),
+  });
+  assert.equal(denied.status, 401);
+
   const suffix = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  const firstToken = await getToken(`ielts-user-a-${suffix}`);
+  const secondToken = await getToken(`ielts-user-b-${suffix}`);
+  const legacyUserId = randomUUID();
+  const legacyInstallationId = `integration-${suffix}-a`;
+  const seedClient = createPgClient();
+  await seedClient.connect();
+  try {
+    await seedClient.query(
+      'INSERT INTO app_user (id, installation_id, display_name) VALUES ($1, $2, $3)',
+      [legacyUserId, legacyInstallationId, 'Legacy anonymous user'],
+    );
+  } finally {
+    await seedClient.end();
+  }
+  temporaryUserIds.push(legacyUserId);
   const firstUserResult = await postJson(`${baseUrl}/api/users/ensure`, {
-    installationId: `integration-${suffix}-a`,
+    installationId: legacyInstallationId,
     deviceModel: 'integration-test-device',
     appVersion: 'test',
-  });
+  }, firstToken);
   const secondUserResult = await postJson(`${baseUrl}/api/users/ensure`, {
     installationId: `integration-${suffix}-b`,
-  });
+  }, secondToken);
   assert.equal(firstUserResult.status, 200);
   assert.equal(secondUserResult.status, 200);
   const firstUser = firstUserResult.body;
   const secondUser = secondUserResult.body;
+  temporaryUserIds.push(secondUser.userId);
+  assert.equal(firstUser.userId, legacyUserId, 'existing device history should link to the first OIDC identity');
   assert.ok(firstUser.userId && firstUser.sessionId);
   assert.ok(secondUser.userId && secondUser.sessionId);
   assert.notEqual(firstUser.userId, secondUser.userId);
+  const sameIdentitySecondDevice = await postJson(`${baseUrl}/api/users/ensure`, {
+    installationId: `integration-${suffix}-a-second-device`,
+  }, firstToken);
+  assert.equal(sameIdentitySecondDevice.body.userId, firstUser.userId);
 
   const attemptIds = [];
   for (let index = 0; index < 3; index += 1) {
     const attempt = await postJson(`${baseUrl}/api/practice-attempts`, {
-      userId: firstUser.userId,
+      userId: secondUser.userId,
       sessionId: firstUser.sessionId,
       accent: 'british',
       topic: 'Daily routine',
@@ -112,19 +184,19 @@ test('PostgreSQL API isolates users, pages attempts, and persists AI exchanges',
       fluency: 78,
       requirements: ['Link usually and take.'],
       createdAt: new Date(Date.now() + index * 1000).toISOString(),
-    });
+    }, firstToken);
     assert.equal(attempt.status, 201);
     attemptIds.push(attempt.body.id);
   }
 
   const pageOne = await getJson(
-    `${baseUrl}/api/practice-attempts?userId=${firstUser.userId}&page=1&pageSize=2`,
+    `${baseUrl}/api/practice-attempts?userId=${secondUser.userId}&page=1&pageSize=2`, firstToken,
   );
   const pageTwo = await getJson(
-    `${baseUrl}/api/practice-attempts?userId=${firstUser.userId}&page=2&pageSize=2`,
+    `${baseUrl}/api/practice-attempts?userId=${secondUser.userId}&page=2&pageSize=2`, firstToken,
   );
   const otherUserPage = await getJson(
-    `${baseUrl}/api/practice-attempts?userId=${secondUser.userId}&page=1&pageSize=2`,
+    `${baseUrl}/api/practice-attempts?userId=${firstUser.userId}&page=1&pageSize=2`, secondToken,
   );
   assert.equal(pageOne.total, 3);
   assert.equal(pageOne.attempts.length, 2);
@@ -137,17 +209,17 @@ test('PostgreSQL API isolates users, pages attempts, and persists AI exchanges',
   const transcription = await postJson(`${baseUrl}/api/transcribe`, {
     audio: `data:audio/wav;base64,${audio}`,
     locale: 'en-GB',
-  });
+  }, firstToken);
   assert.equal(transcription.body.transcript, 'The train arrives at nine.');
 
   const coachResult = await postJson(`${baseUrl}/api/coach`, {
-    userId: firstUser.userId,
+    userId: secondUser.userId,
     sessionId: firstUser.sessionId,
     practiceAttemptId: attemptIds[0],
     message: 'How can I improve this answer?',
     history: [{ role: 'user', content: 'Give me one speaking tip.' }],
     practiceContext: { accent: 'british', overall: 80, transcript: 'I usually take the train.' },
-  });
+  }, firstToken);
   assert.equal(coachResult.status, 200);
   const coach = coachResult.body;
   assert.equal(coach.reply, 'Focus on linking sounds.');
@@ -195,6 +267,17 @@ async function freePort() {
   server.close();
   await once(server, 'close');
   return port;
+}
+
+function createPgClient() {
+  return new pg.Client({
+    host: process.env.DB_HOST,
+    port: Number.parseInt(process.env.DB_PORT ?? '5432', 10),
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
+  });
 }
 
 async function runMigration() {
@@ -258,19 +341,32 @@ async function waitForApi(baseUrl) {
   throw new Error('API did not become ready within 10 seconds');
 }
 
-async function getJson(url) {
-  const response = await fetch(url);
+async function getJson(url, token) {
+  const response = await fetch(url, token ? { headers: { authorization: `Bearer ${token}` } } : undefined);
   assert.equal(response.status, 200);
   return response.json();
 }
 
-async function postJson(url, body) {
+async function postJson(url, body, token) {
+  const headers = { 'content-type': 'application/json' };
+  if (token) headers.authorization = `Bearer ${token}`;
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
   });
   return { status: response.status, body: await response.json() };
+}
+
+async function getToken(subject, authorizedParty = 'ielts-accent-android') {
+  return new SignJWT({ preferred_username: subject, name: `Test ${subject}`, azp: authorizedParty })
+    .setProtectedHeader({ alg: 'RS256', kid: 'ielts-integration-key' })
+    .setIssuer(`http://127.0.0.1:${mockIssuer.address().port}/realms/front`)
+    .setAudience('account')
+    .setSubject(subject)
+    .setIssuedAt()
+    .setExpirationTime('5m')
+    .sign(oidcPrivateKey);
 }
 
 function delay(ms) {

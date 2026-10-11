@@ -1,15 +1,25 @@
+import { readFile } from 'node:fs/promises';
 import http from 'node:http';
+import https from 'node:https';
 import {
   databaseConfigured,
   databaseHealth,
-  ensureUser,
+  ensureOidcUser,
+  findUserIdByOidcSubject,
   insertPracticeAttempt,
   listPracticeAttempts,
   saveConversationExchange,
 } from './database.js';
 import { pageMetadata, parsePageParams } from './pagination.js';
+import { createOidcVerifier } from './oidc.js';
 
 const port = Number.parseInt(process.env.PORT ?? '8041', 10);
+const host = process.env.HOST ?? '127.0.0.1';
+const oidcIssuer = (process.env.OIDC_ISSUER ?? '').replace(/\/$/, '');
+const oidcVerifier = createOidcVerifier({
+  issuer: oidcIssuer,
+  clientIds: (process.env.OIDC_CLIENT_IDS ?? '').split(',').map((value) => value.trim()).filter(Boolean),
+});
 const aiApiKey = (process.env.AI_API_KEY || process.env.DASHSCOPE_API_KEY)?.trim();
 const apiUrl = (process.env.AI_BASE_URL || process.env.DASHSCOPE_API_URL)?.trim()
   ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
@@ -28,7 +38,7 @@ const systemPrompt = `你是一名严谨、友好的 IELTS Speaking 口语教练
 5. 单次回答尽量控制在 300 个中文字符以内；
 6. 只输出纯文本，不使用 Markdown 加粗标记、标题符号或 emoji。`;
 
-const server = http.createServer(async (request, response) => {
+const handleRequest = async (request, response) => {
   setCorsHeaders(response);
   if (request.method === 'OPTIONS') {
     response.writeHead(204);
@@ -52,14 +62,13 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.method === 'POST' && requestUrl.pathname === '/api/users/ensure') {
-    if (!databaseConfigured) {
-      sendJson(response, 503, { error: '数据库尚未配置。' });
-      return;
-    }
+    const identity = await authenticateRequest(request, response, { allowUnregistered: true });
+    if (!identity) return;
     try {
       const body = await readJson(request);
       const installationId = requireText(body.installationId, 'installationId', 80);
-      const record = await ensureUser({
+      const record = await ensureOidcUser({
+        subject: identity.subject,
         installationId,
         displayName: optionalText(body.displayName, 80),
         deviceModel: optionalText(body.deviceModel, 160),
@@ -78,12 +87,14 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.method === 'GET' && requestUrl.pathname === '/api/practice-attempts') {
-    if (!databaseConfigured) {
-      sendJson(response, 503, { error: '数据库尚未配置。' });
-      return;
-    }
+    const identity = await authenticateRequest(request, response);
+    if (!identity) return;
     try {
-      const userId = requireUuid(requestUrl.searchParams.get('userId'), 'userId');
+      const userId = await findUserIdByOidcSubject(identity.subject);
+      if (!userId) {
+        sendJson(response, 401, { error: '登录用户尚未建立本项目会话。' });
+        return;
+      }
       const paging = parsePageParams({
         page: requestUrl.searchParams.get('page'),
         pageSize: requestUrl.searchParams.get('pageSize'),
@@ -115,11 +126,14 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.method === 'POST' && requestUrl.pathname === '/api/practice-attempts') {
-    if (!databaseConfigured) {
-      sendJson(response, 503, { error: '数据库尚未配置。' });
-      return;
-    }
+    const identity = await authenticateRequest(request, response);
+    if (!identity) return;
     try {
+      const userId = await findUserIdByOidcSubject(identity.subject);
+      if (!userId) {
+        sendJson(response, 401, { error: '登录用户尚未建立本项目会话。' });
+        return;
+      }
       const body = await readJson(request);
       const accent = requireText(body.accent, 'accent', 20);
       if (!['british', 'american', 'australian'].includes(accent)) {
@@ -129,7 +143,7 @@ const server = http.createServer(async (request, response) => {
         ? body.requirements.slice(0, 6).map((item) => requireText(item, 'requirements', 500))
         : [];
       const record = await insertPracticeAttempt({
-        userId: requireUuid(body.userId, 'userId'),
+        userId,
         sessionId: optionalUuid(body.sessionId, 'sessionId'),
         accent,
         topic: requireText(body.topic, 'topic', 120),
@@ -152,6 +166,8 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.method === 'POST' && requestUrl.pathname === '/api/transcribe') {
+    const identity = await authenticateRequest(request, response);
+    if (!identity) return;
     if (!asrApiKey) {
       sendJson(response, 503, { error: '本机服务尚未配置 DASHSCOPE_API_KEY。' });
       return;
@@ -216,6 +232,8 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.method === 'POST' && requestUrl.pathname === '/api/coach') {
+    const identity = await authenticateRequest(request, response);
+    if (!identity) return;
     if (!aiApiKey) {
       sendJson(response, 503, { error: '本机服务尚未配置 AI_API_KEY 或 DASHSCOPE_API_KEY。' });
       return;
@@ -270,22 +288,20 @@ const server = http.createServer(async (request, response) => {
       }
       let conversationId = optionalUuid(body.conversationId, 'conversationId');
       let persisted = false;
-      const userId = optionalUuid(body.userId, 'userId');
-      if (databaseConfigured && userId) {
-        try {
-          conversationId = await saveConversationExchange({
-            userId,
-            sessionId: optionalUuid(body.sessionId, 'sessionId'),
-            conversationId,
-            practiceAttemptId: optionalUuid(body.practiceAttemptId, 'practiceAttemptId'),
-            userContent: message,
-            assistantContent: reply.trim(),
-          });
-          persisted = true;
-        } catch {
-          console.error('[coach] Saving the conversation to PostgreSQL failed.');
-        }
+      const userId = await findUserIdByOidcSubject(identity.subject);
+      if (!userId) {
+        sendJson(response, 401, { error: '登录用户尚未建立本项目会话。' });
+        return;
       }
+      conversationId = await saveConversationExchange({
+        userId,
+        sessionId: optionalUuid(body.sessionId, 'sessionId'),
+        conversationId,
+        practiceAttemptId: optionalUuid(body.practiceAttemptId, 'practiceAttemptId'),
+        userContent: message,
+        assistantContent: reply.trim(),
+      });
+      persisted = true;
       sendJson(response, 200, { reply: reply.trim(), conversationId, persisted });
     } catch (error) {
       if (error instanceof RequestError) {
@@ -302,17 +318,53 @@ const server = http.createServer(async (request, response) => {
   }
 
   sendJson(response, 404, { error: '接口不存在。' });
-});
+};
 
-server.listen(port, '127.0.0.1', () => {
-  console.log(`IELTS Accent Lab server listening on http://127.0.0.1:${port}`);
+const tlsKeyPath = process.env.TLS_KEY_PATH ?? '';
+const tlsCertPath = process.env.TLS_CERT_PATH ?? '';
+if (Boolean(tlsKeyPath) !== Boolean(tlsCertPath)) {
+  throw new Error('TLS_KEY_PATH and TLS_CERT_PATH must be configured together.');
+}
+const server = tlsKeyPath
+  ? https.createServer({ key: await readFile(tlsKeyPath), cert: await readFile(tlsCertPath) }, handleRequest)
+  : http.createServer(handleRequest);
+server.listen(port, host, () => {
+  console.log(`IELTS Accent Lab server listening on ${tlsKeyPath ? 'https' : 'http'}://${host}:${port}`);
   console.log(`AI provider: ${aiApiKey ? `configured (${model})` : 'not configured'}`);
 });
 
 function setCorsHeaders(response) {
   response.setHeader('Access-Control-Allow-Origin', '*');
-  response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
   response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+}
+
+async function authenticateRequest(request, response, { allowUnregistered = false } = {}) {
+  if (!oidcVerifier) {
+    sendJson(response, 503, { error: '统一身份服务尚未配置。' });
+    return null;
+  }
+  if (!databaseConfigured) {
+    sendJson(response, 503, { error: '数据库尚未配置。' });
+    return null;
+  }
+  const authorization = request.headers.authorization ?? '';
+  const token = /^Bearer\s+(.+)$/i.exec(authorization)?.[1];
+  if (!token) {
+    sendJson(response, 401, { error: '请先登录后再使用此功能。' });
+    return null;
+  }
+  try {
+    const identity = await oidcVerifier(token);
+    if (!allowUnregistered && !(await findUserIdByOidcSubject(identity.subject))) {
+      sendJson(response, 401, { error: '登录用户尚未建立本项目会话。' });
+      return null;
+    }
+    return identity;
+  } catch {
+    sendJson(response, 401, { error: '登录已失效，请重新登录。' });
+    return null;
+  }
 }
 
 function sendJson(response, statusCode, body) {

@@ -18,8 +18,8 @@
 - 每次跟读保留本地 WAV，可在评分结果和最近练习中回放
 - 根据漏词、流利度和当前训练重点生成下一轮跟读要求
 - 本次训练进度和最近练习记录
-- PostgreSQL 持久化用户、会话、语音转写文本、评分、训练要求和 AI 对话
-- APP 启动时按本机安装 ID 恢复历史，录音始终只保存在 Android 本地缓存
+- Keycloak OIDC + PKCE 统一登录；每个 IELTS PostgreSQL 用户以身份服务的 `sub` 映射，设备会话与其他项目数据库隔离
+- PostgreSQL 持久化用户、会话、语音转写文本、评分、训练要求和 AI 对话；录音始终只保存在 Android 本地缓存
 - 携带最近一次跟读结果与百炼 AI 教练对话
 - API Key 仅保存在 `server/.env`，不会打包进 APK
 
@@ -50,7 +50,7 @@ $env:FLUTTER_SKIP_UPDATE_CHECK='true'
 flutter --no-version-check run
 ```
 
-APP 默认请求 `http://127.0.0.1:8041`。真机通过 `adb reverse` 访问电脑上的代理，不需要在同一 Wi-Fi 下暴露服务端口。
+首次打开时通过系统浏览器完成统一账号登录，客户端使用授权码 + PKCE，不包含客户端密钥。APP 默认请求 `http://127.0.0.1:8041`；OIDC issuer 使用 LAN 身份服务 HTTPS 地址。Android 真机需要先信任 LAN 开发 CA，再通过 `adb reverse` 访问本机 API。
 
 ## 构建 APK
 
@@ -58,6 +58,12 @@ APP 默认请求 `http://127.0.0.1:8041`。真机通过 `adb reverse` 访问电�
 cd D:\workspace\front\ielts_accent_coach
 $env:FLUTTER_SKIP_UPDATE_CHECK='true'
 flutter --no-version-check build apk --debug
+```
+
+局域网调试构建将 API 地址切换到 IELTS API 的 HTTPS 地址：
+
+```powershell
+flutter --no-version-check build apk --debug --dart-define=IELTS_API_BASE_URL=https://192.168.1.9:8041 --dart-define=IELTS_OIDC_ISSUER=https://192.168.1.9:8042/realms/front
 ```
 
 输出文件：`build\app\outputs\flutter-apk\app-debug.apk`。
@@ -78,6 +84,10 @@ $pgAdmin = Read-Host 'PostgreSQL 管理员角色'
 - `DASHSCOPE_MODEL`：默认 `qwen-plus`
 - `DASHSCOPE_ASR_MODEL`：语音识别模型，默认 `qwen3-asr-flash`
 - `PORT`：本机代理端口，默认 `8041`
+- `HOST`：服务绑定地址，本机默认 `127.0.0.1`，LAN 部署设为 `0.0.0.0`
+- `OIDC_ISSUER` / `OIDC_CLIENT_IDS`：Keycloak issuer 和允许的 IELTS Android client ID
+- `TLS_KEY_PATH` / `TLS_CERT_PATH`：成对设置时启用 API HTTPS；局域网部署应使用身份服务签发的开发证书
+- `NODE_EXTRA_CA_CERTS`：Node 校验 LAN Keycloak HTTPS 的开发 CA 路径
 - `DB_HOST` / `DB_PORT`：PostgreSQL 地址和端口
 - `DB_USER` / `DB_PASSWORD`：PostgreSQL 登录信息
 - `DB_NAME`：独立业务数据库，默认 `ielts_accent_lab`
@@ -109,7 +119,7 @@ cd D:\workspace\front\ielts_accent_coach\server
 npm test
 ```
 
-PostgreSQL 集成测试会创建/写入数据库并模拟 AI 与 ASR 响应。仅使用以 `_test` 结尾的独立库；测试数据库会保留供检查：
+PostgreSQL 集成测试会创建/写入数据库、验证 OIDC 签名/JWKS 和用户隔离，并模拟 AI 与 ASR 响应。测试用户会在测试结束后清理。仅使用以 `_test` 结尾的独立库：
 
 ```powershell
 cd D:\workspace\front\ielts_accent_coach\server

@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter_appauth/flutter_appauth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -19,6 +20,12 @@ const _teal = Color(0xFF15807A);
 const _coral = Color(0xFFE76F51);
 const _paper = Color(0xFFF7F8F5);
 const _line = Color(0xFFDDE2E0);
+const _oidcIssuer = String.fromEnvironment(
+  'IELTS_OIDC_ISSUER',
+  defaultValue: 'https://192.168.1.9:8042/realms/front',
+);
+const _oidcClientId = 'ielts-accent-android';
+const _oidcRedirectUrl = 'ieltsaccentcoach:/oauth2redirect';
 
 class IeltsAccentApp extends StatelessWidget {
   const IeltsAccentApp({super.key});
@@ -127,7 +134,14 @@ class _AppShellState extends State<AppShell> {
   int _tabIndex = 0;
   int _lineIndex = 0;
   AccentProfile _accent = AccentProfile.british;
-  String _apiBaseUrl = 'http://127.0.0.1:8041';
+  String _apiBaseUrl = const String.fromEnvironment(
+    'IELTS_API_BASE_URL',
+    defaultValue: 'http://127.0.0.1:8041',
+  );
+  final FlutterAppAuth _appAuth = const FlutterAppAuth();
+  String? _accessToken;
+  bool _loggingIn = false;
+  String? _loginError;
   final List<AttemptRecord> _attempts = [];
   final List<AttemptRecord> _historyAttempts = [];
   AttemptRecord? _latestAttempt;
@@ -136,7 +150,6 @@ class _AppShellState extends State<AppShell> {
   int _historyTotal = 0;
   int _historyTotalPages = 1;
   bool _historyLoading = false;
-  late final Future<void> _backendReady;
   String? _userId;
   String? _sessionId;
   String? _conversationId;
@@ -155,22 +168,60 @@ class _AppShellState extends State<AppShell> {
   PracticeLine get _currentLine =>
       _accentLines[_lineIndex % _accentLines.length];
 
-  @override
-  void initState() {
-    super.initState();
-    _backendReady = _initializeBackend();
+  Future<void> _signIn() async {
+    if (_loggingIn) return;
+    setState(() {
+      _loggingIn = true;
+      _loginError = null;
+    });
+    try {
+      final result = await _appAuth.authorizeAndExchangeCode(
+        AuthorizationTokenRequest(
+          _oidcClientId,
+          _oidcRedirectUrl,
+          issuer: _oidcIssuer,
+          scopes: const ['openid', 'profile'],
+        ),
+      );
+      final token = result.accessToken;
+      if (token == null || token.isEmpty) {
+        throw const CoachApiException('统一登录没有返回访问令牌。');
+      }
+      if (!mounted) return;
+      setState(() => _accessToken = token);
+      await _initializeBackend(token);
+    } catch (error) {
+      if (mounted) setState(() => _loginError = '登录失败：$error');
+    } finally {
+      if (mounted) setState(() => _loggingIn = false);
+    }
   }
 
-  Future<void> _initializeBackend() async {
+  void _signOut() {
+    setState(() {
+      _accessToken = null;
+      _userId = null;
+      _sessionId = null;
+      _databaseOnline = false;
+      _conversationId = null;
+      _attempts.clear();
+      _historyAttempts.clear();
+      _latestAttempt = null;
+      _historyTotal = 0;
+      _historyPage = 1;
+    });
+  }
+
+  Future<void> _initializeBackend(String accessToken) async {
     try {
       final identity = await NativeSpeechService().getDeviceIdentity();
-      final api = CoachApi(baseUrl: _apiBaseUrl);
+      final api = CoachApi(baseUrl: _apiBaseUrl, accessToken: accessToken);
       final registration = await api.ensureUser(
         installationId: identity.installationId,
         deviceModel: identity.deviceModel,
         appVersion: identity.appVersion,
       );
-      final storedPage = await api.loadAttempts(registration.userId);
+      final storedPage = await api.loadAttempts();
       final recordingReferences = await NativeSpeechService()
           .getRecordingReferences();
       if (!mounted) return;
@@ -258,22 +309,29 @@ class _AppShellState extends State<AppShell> {
           _historyAttempts.removeLast();
         }
       }
-      _historyTotalPages =
-          (_historyTotal / _historyPageSize).ceil().clamp(1, 1 << 30).toInt();
+      _historyTotalPages = (_historyTotal / _historyPageSize)
+          .ceil()
+          .clamp(1, 1 << 30)
+          .toInt();
     });
     unawaited(_persistAttempt(attempt));
   }
 
   Future<void> _loadHistoryPage(int page) async {
     final userId = _userId;
-    if (userId == null || !_databaseOnline || _historyLoading) return;
+    final accessToken = _accessToken;
+    if (userId == null ||
+        accessToken == null ||
+        !_databaseOnline ||
+        _historyLoading) {
+      return;
+    }
     setState(() => _historyLoading = true);
     try {
-      final result = await CoachApi(baseUrl: _apiBaseUrl).loadAttempts(
-        userId,
-        page: page,
-        pageSize: _historyPageSize,
-      );
+      final result = await CoachApi(
+        baseUrl: _apiBaseUrl,
+        accessToken: accessToken,
+      ).loadAttempts(page: page, pageSize: _historyPageSize);
       final recordingReferences = await NativeSpeechService()
           .getRecordingReferences();
       if (!mounted) return;
@@ -294,9 +352,9 @@ class _AppShellState extends State<AppShell> {
       });
     } on CoachApiException catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('读取练习历史失败：${error.message}')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('读取练习历史失败：${error.message}')));
       }
     } finally {
       if (mounted) setState(() => _historyLoading = false);
@@ -304,28 +362,31 @@ class _AppShellState extends State<AppShell> {
   }
 
   Future<void> _persistAttempt(AttemptRecord attempt) async {
-    await _backendReady;
     final userId = _userId;
     final sessionId = _sessionId;
-    if (userId == null || sessionId == null) return;
+    final accessToken = _accessToken;
+    if (userId == null || sessionId == null || accessToken == null) return;
     if (mounted) setState(() => _pendingSyncs++);
     try {
-      final saved = await CoachApi(baseUrl: _apiBaseUrl).saveAttempt(
-        userId: userId,
-        sessionId: sessionId,
-        accent: attempt.line.accent.name,
-        topic: attempt.line.topic,
-        level: attempt.line.level,
-        reference: attempt.line.text,
-        transcript: attempt.transcript,
-        focus: attempt.line.focus,
-        overall: attempt.result.overall,
-        accuracy: attempt.result.accuracy,
-        completeness: attempt.result.completeness,
-        fluency: attempt.result.fluency,
-        requirements: _nextRoundRequirements(attempt.result, attempt.line),
-        createdAt: attempt.createdAt,
-      );
+      final saved =
+          await CoachApi(
+            baseUrl: _apiBaseUrl,
+            accessToken: accessToken,
+          ).saveAttempt(
+            sessionId: sessionId,
+            accent: attempt.line.accent.name,
+            topic: attempt.line.topic,
+            level: attempt.line.level,
+            reference: attempt.line.text,
+            transcript: attempt.transcript,
+            focus: attempt.line.focus,
+            overall: attempt.result.overall,
+            accuracy: attempt.result.accuracy,
+            completeness: attempt.result.completeness,
+            fluency: attempt.result.fluency,
+            requirements: _nextRoundRequirements(attempt.result, attempt.line),
+            createdAt: attempt.createdAt,
+          );
       if (attempt.recordingPath != null) {
         await NativeSpeechService().saveRecordingReference(
           attemptId: saved.id,
@@ -351,6 +412,50 @@ class _AppShellState extends State<AppShell> {
 
   @override
   Widget build(BuildContext context) {
+    if (_accessToken == null) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('IELTS Accent Lab')),
+        body: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 360),
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const _BrandMark(),
+                  const SizedBox(height: 20),
+                  Text(
+                    '登录后同步练习记录',
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  const SizedBox(height: 20),
+                  FilledButton.icon(
+                    onPressed: _loggingIn ? null : _signIn,
+                    icon: _loggingIn
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.login),
+                    label: Text(_loggingIn ? '正在连接统一登录' : '使用统一账号登录'),
+                  ),
+                  if (_loginError != null) ...[
+                    const SizedBox(height: 16),
+                    Text(
+                      _loginError!,
+                      style: const TextStyle(color: _coral),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
     final pages = [
       PracticePage(
         key: ValueKey('${_accent.name}-$_lineIndex'),
@@ -358,6 +463,7 @@ class _AppShellState extends State<AppShell> {
         line: _currentLine,
         attempts: _attempts,
         apiBaseUrl: _apiBaseUrl,
+        accessToken: _accessToken!,
         onAccentChanged: _changeAccent,
         onAttempt: _addAttempt,
         onNext: _nextLine,
@@ -366,7 +472,7 @@ class _AppShellState extends State<AppShell> {
         messages: _messages,
         latestAttempt: _latestAttempt,
         apiBaseUrl: _apiBaseUrl,
-        userId: _userId,
+        accessToken: _accessToken!,
         sessionId: _sessionId,
         conversationId: _conversationId,
         onMessagesChanged: () => setState(() {}),
@@ -401,6 +507,13 @@ class _AppShellState extends State<AppShell> {
             ),
           ],
         ),
+        actions: [
+          IconButton(
+            tooltip: '退出登录',
+            onPressed: _signOut,
+            icon: const Icon(Icons.logout),
+          ),
+        ],
       ),
       body: IndexedStack(index: _tabIndex, children: pages),
       bottomNavigationBar: NavigationBar(
@@ -451,6 +564,7 @@ class PracticePage extends StatefulWidget {
     required this.line,
     required this.attempts,
     required this.apiBaseUrl,
+    required this.accessToken,
     required this.onAccentChanged,
     required this.onAttempt,
     required this.onNext,
@@ -460,6 +574,7 @@ class PracticePage extends StatefulWidget {
   final PracticeLine line;
   final List<AttemptRecord> attempts;
   final String apiBaseUrl;
+  final String accessToken;
   final ValueChanged<AccentProfile> onAccentChanged;
   final ValueChanged<AttemptRecord> onAttempt;
   final VoidCallback onNext;
@@ -540,6 +655,7 @@ class _PracticePageState extends State<PracticePage> {
       final recording = await _speech.stopRecording();
       final transcript = await CoachApi(
         baseUrl: widget.apiBaseUrl,
+        accessToken: widget.accessToken,
       ).transcribe(wavBytes: recording.bytes, locale: widget.accent.locale);
       _applyRecognition(transcript, 0, recordingPath: recording.path);
     } on PlatformException catch (error) {
@@ -1044,7 +1160,7 @@ class CoachPage extends StatefulWidget {
     required this.messages,
     required this.latestAttempt,
     required this.apiBaseUrl,
-    required this.userId,
+    required this.accessToken,
     required this.sessionId,
     required this.conversationId,
     required this.onMessagesChanged,
@@ -1055,7 +1171,7 @@ class CoachPage extends StatefulWidget {
   final List<CoachMessage> messages;
   final AttemptRecord? latestAttempt;
   final String apiBaseUrl;
-  final String? userId;
+  final String accessToken;
   final String? sessionId;
   final String? conversationId;
   final VoidCallback onMessagesChanged;
@@ -1091,15 +1207,18 @@ class _CoachPageState extends State<CoachPage> {
     widget.onMessagesChanged();
     _scrollToBottom();
     try {
-      final reply = await CoachApi(baseUrl: widget.apiBaseUrl).ask(
-        message: message,
-        history: widget.messages,
-        practiceContext: _practiceContext(widget.latestAttempt),
-        userId: widget.userId,
-        sessionId: widget.sessionId,
-        conversationId: widget.conversationId,
-        practiceAttemptId: widget.latestAttempt?.serverId,
-      );
+      final reply =
+          await CoachApi(
+            baseUrl: widget.apiBaseUrl,
+            accessToken: widget.accessToken,
+          ).ask(
+            message: message,
+            history: widget.messages,
+            practiceContext: _practiceContext(widget.latestAttempt),
+            sessionId: widget.sessionId,
+            conversationId: widget.conversationId,
+            practiceAttemptId: widget.latestAttempt?.serverId,
+          );
       if (!mounted) return;
       setState(
         () => widget.messages.add(
@@ -1387,10 +1506,7 @@ class ProgressPage extends StatelessWidget {
             child: Row(
               children: [
                 Expanded(
-                  child: _SummaryValue(
-                    value: '$total',
-                    label: '完成次数',
-                  ),
+                  child: _SummaryValue(value: '$total', label: '完成次数'),
                 ),
                 Expanded(
                   child: _SummaryValue(value: '$average', label: '本页均分'),
@@ -1457,9 +1573,7 @@ class ProgressPage extends StatelessWidget {
                     icon: const Icon(Icons.chevron_left),
                     label: const Text('上一页'),
                   ),
-                  Expanded(
-                    child: Center(child: Text('$page / $totalPages 页')),
-                  ),
+                  Expanded(child: Center(child: Text('$page / $totalPages 页'))),
                   OutlinedButton.icon(
                     onPressed: page < totalPages && !loading
                         ? () => onPageChanged(page + 1)

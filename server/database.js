@@ -41,42 +41,79 @@ export async function databaseHealth() {
   }
 }
 
-export async function ensureUser({ installationId, displayName, deviceModel, appVersion }) {
+export async function ensureOidcUser({ subject, installationId, displayName, deviceModel, appVersion }) {
   requireDatabase();
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const proposedUserId = randomUUID();
-    const userResult = await client.query(
-      `INSERT INTO app_user (id, installation_id, display_name)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (installation_id) DO UPDATE
-       SET display_name = COALESCE(EXCLUDED.display_name, app_user.display_name),
-           last_seen_at = NOW()
-       RETURNING id, installation_id, display_name, created_at`,
-      [proposedUserId, installationId, displayName || null],
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`ielts-oidc:${subject}`]);
+    let userResult = await client.query(
+      `SELECT id, installation_id, display_name, created_at
+       FROM app_user WHERE oidc_subject = $1 FOR UPDATE`,
+      [subject],
     );
-    const userId = userResult.rows[0].id;
+    if (userResult.rowCount === 0) {
+      const anonymous = await client.query(
+        `SELECT id FROM app_user
+         WHERE installation_id = $1 AND oidc_subject IS NULL FOR UPDATE`,
+        [installationId],
+      );
+      if (anonymous.rowCount > 0) {
+        userResult = await client.query(
+          `UPDATE app_user
+           SET oidc_subject = $2,
+               display_name = COALESCE($3, display_name),
+               last_seen_at = NOW()
+           WHERE id = $1
+           RETURNING id, installation_id, display_name, created_at`,
+          [anonymous.rows[0].id, subject, displayName || null],
+        );
+      } else {
+        const occupiedInstallation = await client.query(
+          'SELECT 1 FROM app_user WHERE installation_id = $1',
+          [installationId],
+        );
+        userResult = await client.query(
+          `INSERT INTO app_user (id, installation_id, display_name, oidc_subject)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (oidc_subject) WHERE oidc_subject IS NOT NULL DO UPDATE
+           SET display_name = COALESCE(EXCLUDED.display_name, app_user.display_name),
+               last_seen_at = NOW()
+           RETURNING id, installation_id, display_name, created_at`,
+          [randomUUID(), occupiedInstallation.rowCount === 0 ? installationId : null, displayName || null, subject],
+        );
+      }
+    } else {
+      await client.query(
+        'UPDATE app_user SET last_seen_at = NOW(), display_name = COALESCE($2, display_name) WHERE id = $1',
+        [userResult.rows[0].id, displayName || null],
+      );
+    }
+    const user = userResult.rows[0];
     await client.query(
-      `INSERT INTO user_setting (user_id)
-       VALUES ($1)
-       ON CONFLICT (user_id) DO NOTHING`,
-      [userId],
+      'INSERT INTO user_setting (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING',
+      [user.id],
     );
     const sessionId = randomUUID();
     await client.query(
       `INSERT INTO app_session (id, user_id, device_model, app_version)
        VALUES ($1, $2, $3, $4)`,
-      [sessionId, userId, deviceModel || null, appVersion || null],
+      [sessionId, user.id, deviceModel || null, appVersion || null],
     );
     await client.query('COMMIT');
-    return { user: userResult.rows[0], sessionId };
+    return { user, sessionId };
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
   } finally {
     client.release();
   }
+}
+
+export async function findUserIdByOidcSubject(subject) {
+  requireDatabase();
+  const result = await pool.query('SELECT id FROM app_user WHERE oidc_subject = $1', [subject]);
+  return result.rows[0]?.id ?? null;
 }
 
 export async function insertPracticeAttempt(input) {
